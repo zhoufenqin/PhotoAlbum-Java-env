@@ -19,6 +19,10 @@
       "sha256": "3ff09769e72a9572d19d3e5c5671acddd937c7e06ed808cea68e86c2393d9d14"
     },
     "windows-amd64": {
+      "urls": [
+        "https://download.visualstudio.microsoft.com/download/pr/a4a4a1b7-961d-4ebc-afd0-66d395fbd595/Java_Engineering_Group/AppCAT-for-java-cli/7.7.0.10/azure-migrate-appcat-for-java-cli-windows-amd64-7.7.0.10.zip",
+        "https://download.visualstudio.microsoft.com/download/pr/a4a4a1b7-961d-4ebc-afd0-66d395fbd595/Java_Engineering_Group/AppCAT-for-java-cli/7.7.0.10/azure-migrate-appcat-for-java-cli-windows-amd64-7.7.0.10.zip?download=1"
+      ],
       "url": "https://download.visualstudio.microsoft.com/download/pr/a4a4a1b7-961d-4ebc-afd0-66d395fbd595/Java_Engineering_Group/AppCAT-for-java-cli/7.7.0.10/azure-migrate-appcat-for-java-cli-windows-amd64-7.7.0.10.zip",
       "sha256": "2518239c959f38123e1e1f7109d214dc6a5455df89a2195e223f829913722785"
     },

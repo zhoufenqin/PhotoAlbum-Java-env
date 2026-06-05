@@ -414,109 +414,244 @@ function sha256Of(filePath) {
   });
 }
 
-function httpGet(url, dest, redirectsLeft = 5) {
-  // Abort the request if no data arrives for this long, so a stalled connection fails
-  // fast and is retried instead of hanging until the surrounding harness times out.
-  const IDLE_TIMEOUT_MS = 60_000;
-  // Emit a liveness line on this cadence regardless of data flow, so a slow or
-  // briefly-stalled sandbox download is not mistaken for a hung process.
-  const HEARTBEAT_MS = 5_000;
+function normalizeCandidateUrls(entry) {
+  const urls = [];
+  if (Array.isArray(entry.urls)) {
+    for (const candidate of entry.urls) {
+      if (typeof candidate === 'string' && candidate.trim()) {
+        urls.push(candidate.trim());
+      }
+    }
+  }
+  if (typeof entry.url === 'string' && entry.url.trim()) {
+    urls.push(entry.url.trim());
+  }
+  return [...new Set(urls)];
+}
+
+function probeUrl(url, timeoutMs = 8_000, redirectsLeft = 5) {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const req = https.request(url, { method: 'HEAD' }, (res) => {
+      const status = res.statusCode || 0;
+      if ([301, 302, 303, 307, 308].includes(status) && redirectsLeft > 0 && res.headers.location) {
+        const location = new URL(res.headers.location, url).toString();
+        res.resume();
+        resolve(probeUrl(location, timeoutMs, redirectsLeft - 1));
+        return;
+      }
+      res.resume();
+      resolve({
+        url,
+        ok: status > 0 && status < 500,
+        latencyMs: Date.now() - startedAt,
+        status,
+      });
+    });
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`probe timeout after ${timeoutMs}ms`));
+    });
+    req.on('error', (err) => resolve({
+      url,
+      ok: false,
+      latencyMs: Number.POSITIVE_INFINITY,
+      status: 0,
+      error: err.message || String(err),
+    }));
+    req.end();
+  });
+}
+
+async function orderCandidateUrls(urls) {
+  const probes = await Promise.all(urls.map((url) => probeUrl(url)));
+  const sorted = [...probes].sort((a, b) => {
+    if (a.ok !== b.ok) return a.ok ? -1 : 1;
+    return a.latencyMs - b.latencyMs;
+  });
+  const ordered = sorted.map((item) => item.url);
+  const details = sorted
+    .map((item) => `${item.url} [${item.ok ? 'ok' : 'fail'}${Number.isFinite(item.latencyMs) ? `, ${item.latencyMs}ms` : ''}]`)
+    .join(', ');
+  log(`Download source probe: ${details}`);
+  return ordered;
+}
+
+function waitWithJitter(attempt) {
+  const base = Math.min(8_000, 500 * (2 ** Math.max(0, attempt - 1)));
+  const jitter = Math.floor(Math.random() * 300);
+  return sleep(base + jitter);
+}
+
+function httpGet(url, dest, options = {}) {
+  const CONNECT_TIMEOUT_MS = options.connectTimeoutMs || 30_000;
+  const READ_TIMEOUT_MS = options.readTimeoutMs || 300_000;
+  const HEARTBEAT_MS = options.heartbeatMs || 5_000;
+  const resumeFrom = Math.max(0, Number(options.resumeFrom || 0));
+  const redirectsLeft = Number.isInteger(options.redirectsLeft) ? options.redirectsLeft : 5;
 
   return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(dest);
+    let connectTimer = null;
     let heartbeat = null;
+    let file = null;
+    let settled = false;
+    let phase = 'connecting';
+    let effectiveStart = resumeFrom;
+    let totalBytes = 0;
+    let received = 0;
+    const startedAt = Date.now();
+
     const stopHeartbeat = () => {
       if (heartbeat) {
         clearInterval(heartbeat);
         heartbeat = null;
       }
     };
-
-    const cleanupAndReject = (err) => {
+    const clearConnectTimer = () => {
+      if (connectTimer) {
+        clearTimeout(connectTimer);
+        connectTimer = null;
+      }
+    };
+    const closeFile = (cb) => {
+      if (!file) {
+        cb();
+        return;
+      }
+      const current = file;
+      file = null;
+      current.close(() => cb());
+    };
+    const finish = (fn) => {
+      if (settled) return;
+      settled = true;
       stopHeartbeat();
-      file.close(() => {
-        fs.rm(dest, { force: true }, () => reject(err));
-      });
+      clearConnectTimer();
+      closeFile(fn);
+    };
+    const cleanupAndReject = (err) => {
+      finish(() => reject(err));
     };
 
-    const req = https.get(url, (res) => {
+    heartbeat = setInterval(() => {
+      const secs = Math.round((Date.now() - startedAt) / 1000);
+      if (phase === 'connecting') {
+        log(`Connecting to download source... ${secs}s elapsed`);
+        return;
+      }
+      const downloadedMb = ((effectiveStart + received) / 1048576).toFixed(1);
+      const totalMb = totalBytes ? (totalBytes / 1048576).toFixed(1) : '?';
+      const pct = totalBytes ? ` (${Math.floor(((effectiveStart + received) / totalBytes) * 100)}%)` : '';
+      log(`Downloading AppCAT: ${downloadedMb}/${totalMb} MB${pct} — ${secs}s elapsed`);
+    }, HEARTBEAT_MS);
+    if (typeof heartbeat.unref === 'function') {
+      heartbeat.unref();
+    }
+
+    const headers = resumeFrom > 0 ? { Range: `bytes=${resumeFrom}-` } : {};
+    const req = https.get(url, { headers }, (res) => {
+      clearConnectTimer();
       const status = res.statusCode || 0;
+
       if ([301, 302, 303, 307, 308].includes(status)) {
         res.resume();
-        file.close();
         if (redirectsLeft <= 0) {
-          reject(new Error('Too many redirects'));
+          cleanupAndReject(new Error('Too many redirects'));
           return;
         }
         const location = res.headers.location;
         if (!location) {
-          reject(new Error(`Redirect (${status}) without Location header`));
+          cleanupAndReject(new Error(`Redirect (${status}) without Location header`));
           return;
         }
-        resolve(httpGet(new URL(location, url).toString(), dest, redirectsLeft - 1));
+        const redirected = new URL(location, url).toString();
+        finish(() => {
+          resolve(httpGet(redirected, dest, {
+            ...options,
+            redirectsLeft: redirectsLeft - 1,
+            resumeFrom,
+          }));
+        });
         return;
       }
-      if (status !== 200) {
+
+      if (resumeFrom > 0 && status === 416) {
+        res.resume();
+        finish(() => resolve());
+        return;
+      }
+
+      if (status !== 200 && status !== 206) {
         res.resume();
         cleanupAndReject(new Error(`HTTP ${status}`));
         return;
       }
 
-      const totalBytes = Number(res.headers['content-length']) || 0;
-      const totalMb = totalBytes ? (totalBytes / 1048576).toFixed(1) : '?';
-      let received = 0;
-      const startedAt = Date.now();
+      if (resumeFrom > 0 && status === 200) {
+        log('Server did not honor range request; restarting full download from byte 0.');
+        effectiveStart = 0;
+      } else if (resumeFrom > 0 && status === 206) {
+        effectiveStart = resumeFrom;
+      }
 
-      log(totalBytes
-        ? `Connected; downloading ${totalMb} MB...`
-        : 'Connected; downloading (size unknown)...');
+      phase = 'downloading';
+      const length = Number(res.headers['content-length']) || 0;
+      totalBytes = length ? length + effectiveStart : 0;
 
+      file = fs.createWriteStream(dest, { flags: effectiveStart > 0 ? 'a' : 'w' });
+      file.on('error', cleanupAndReject);
+      res.on('error', cleanupAndReject);
+      res.setTimeout(READ_TIMEOUT_MS, () => {
+        req.destroy(new Error(`Read stalled (no data for ${READ_TIMEOUT_MS / 1000}s)`));
+      });
       res.on('data', (chunk) => {
         received += chunk.length;
       });
-
-      // Time-based heartbeat: fires even when no data event arrives, so the agent
-      // can tell "downloading slowly" apart from "process hung".
-      heartbeat = setInterval(() => {
-        const secs = Math.round((Date.now() - startedAt) / 1000);
-        const mb = (received / 1048576).toFixed(1);
-        const pct = totalBytes ? ` (${Math.floor((received / totalBytes) * 100)}%)` : '';
-        log(`Downloading AppCAT: ${mb}/${totalMb} MB${pct} — ${secs}s elapsed`);
-      }, HEARTBEAT_MS);
-      if (typeof heartbeat.unref === 'function') {
-        heartbeat.unref();
-      }
-
       res.pipe(file);
       file.on('finish', () => {
-        stopHeartbeat();
-        file.close(() => resolve());
+        finish(() => resolve());
       });
-      file.on('error', cleanupAndReject);
-      res.on('error', cleanupAndReject);
     });
 
-    req.setTimeout(IDLE_TIMEOUT_MS, () => {
-      req.destroy(new Error(`Download stalled (no data for ${IDLE_TIMEOUT_MS / 1000}s)`));
-    });
+    connectTimer = setTimeout(() => {
+      req.destroy(new Error(`Connection timeout after ${CONNECT_TIMEOUT_MS / 1000}s`));
+    }, CONNECT_TIMEOUT_MS);
+    if (typeof connectTimer.unref === 'function') {
+      connectTimer.unref();
+    }
     req.on('error', cleanupAndReject);
   });
 }
 
-async function downloadFile(url, dest, maxRetries = 5) {
+async function downloadFile(urls, dest, maxRetries = 5) {
+  const ordered = await orderCandidateUrls(urls);
+  const part = `${dest}.part`;
   let lastError;
+
   for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
-    try {
-      log(`Downloading AppCAT (attempt ${attempt}); this is a large download (~140 MB) and may take a few minutes...`);
-      await httpGet(url, dest);
-      log('Download complete.');
-      return;
-    } catch (exc) {
-      lastError = exc;
-      log(`Download failed: ${exc.message || exc}`);
-      if (attempt < maxRetries) {
-        await sleep(attempt * 500);
+    for (const [sourceIndex, url] of ordered.entries()) {
+      try {
+        const existingBytes = isFile(part) ? fs.statSync(part).size : 0;
+        const existingMb = (existingBytes / 1048576).toFixed(1);
+        log(
+          `Downloading AppCAT (attempt ${attempt}/${maxRetries}, source ${sourceIndex + 1}/${ordered.length}); `
+          + `resuming at ${existingMb} MB...`,
+        );
+        await httpGet(url, part, {
+          resumeFrom: existingBytes,
+          connectTimeoutMs: 30_000,
+          readTimeoutMs: 300_000,
+          heartbeatMs: 5_000,
+        });
+        fs.renameSync(part, dest);
+        log(`Download complete from ${url}.`);
+        return;
+      } catch (exc) {
+        lastError = exc;
+        log(`Download failed from ${url}: ${exc.message || exc}`);
       }
+    }
+    if (attempt < maxRetries) {
+      await waitWithJitter(attempt);
     }
   }
   fail(`Failed to download AppCAT after ${maxRetries} attempts: ${lastError}`);
@@ -605,6 +740,10 @@ async function ensureAppcat(manifest, platformKey, osName, ext, cacheRoot) {
   if (!entry) {
     fail(`Manifest has no entry for platform '${platformKey}'.`);
   }
+  const candidateUrls = normalizeCandidateUrls(entry);
+  if (candidateUrls.length === 0) {
+    fail(`Manifest platform '${platformKey}' has no downloadable URL.`);
+  }
 
   const version = manifest.version || 'unknown';
   const installDir = path.join(cacheRoot, version, platformKey);
@@ -618,7 +757,7 @@ async function ensureAppcat(manifest, platformKey, osName, ext, cacheRoot) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'appcat-dl-'));
   try {
     const archivePath = path.join(tmp, `appcat.${ext}`);
-    await downloadFile(entry.url, archivePath);
+    await downloadFile(candidateUrls, archivePath);
 
     const expected = (entry.sha256 || '').toLowerCase();
     const actual = (await sha256Of(archivePath)).toLowerCase();
