@@ -624,6 +624,9 @@ function httpGet(url, dest, options = {}) {
 
 async function downloadFile(urls, dest, maxRetries = 5) {
   const ordered = await orderCandidateUrls(urls);
+  if (ordered.length === 0) {
+    fail('No download URL available for AppCAT.');
+  }
   const part = `${dest}.part`;
   let lastError;
 
@@ -735,6 +738,17 @@ function findAppcatExecutable(rootDir, osName) {
   return null;
 }
 
+function validatedLauncherName(executable, osName) {
+  const launcher = path.basename(executable).toLowerCase();
+  const allowed = osName === 'windows'
+    ? new Set(['appcat.exe', 'appcat.bat', 'appcat.cmd', 'appcat'])
+    : new Set(['appcat', 'appcat.sh']);
+  if (!allowed.has(launcher)) {
+    fail(`Unexpected AppCAT launcher name: ${launcher}`);
+  }
+  return launcher;
+}
+
 async function ensureAppcat(manifest, platformKey, osName, ext, cacheRoot) {
   const entry = (manifest.platforms || {})[platformKey];
   if (!entry) {
@@ -792,21 +806,25 @@ async function ensureAppcat(manifest, platformKey, osName, ext, cacheRoot) {
 }
 
 function runAppcat(executable, args, osName) {
-  const lower = executable.toLowerCase();
+  const launcher = validatedLauncherName(executable, osName);
+  const lower = launcher.toLowerCase();
   let command;
   let commandArgs;
+  let spawnOptions;
   if (osName === 'windows' && (lower.endsWith('.bat') || lower.endsWith('.cmd'))) {
     command = 'cmd';
-    commandArgs = ['/c', executable, ...args];
+    commandArgs = ['/d', '/s', '/c', launcher, ...args];
+    spawnOptions = { cwd: path.dirname(executable), stdio: 'inherit' };
   } else {
-    command = executable;
+    command = osName === 'windows' ? launcher : `./${launcher}`;
     commandArgs = args;
+    spawnOptions = { cwd: path.dirname(executable), stdio: 'inherit' };
   }
 
   log(`Running: appcat ${args.join(' ')}`);
   // appcat streams its own per-rule progress to the console (stdio: 'inherit'),
   // so the analysis phase is self-evidently alive without extra heartbeat logging.
-  const completed = spawnSync(command, commandArgs, { stdio: 'inherit' });
+  const completed = spawnSync(command, commandArgs, spawnOptions);
   if (completed.error) {
     return 1;
   }
